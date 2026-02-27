@@ -1,2 +1,2 @@
 [deploy]
-startCommand = "./out rest --port $PORT"
+startCommand = "./out rest --port $PORT --db-uri $DATABASE_URL"
