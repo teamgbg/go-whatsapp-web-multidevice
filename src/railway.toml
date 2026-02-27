@@ -1,2 +1,5 @@
+[build]
+dockerfilePath = "Dockerfile"
+
 [deploy]
-startCommand = "./out rest --port $PORT --db-uri $DATABASE_URL"
+startCommand = "/app/whatsapp rest --port $PORT"
