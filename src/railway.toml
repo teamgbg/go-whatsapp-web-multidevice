@@ -1,0 +1,2 @@
+[deploy]
+startCommand = "./go-whatsapp-web-multidevice rest --port $PORT"
