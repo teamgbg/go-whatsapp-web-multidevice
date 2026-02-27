@@ -137,6 +137,26 @@ func ExtractMessageTextFromProto(msg *waE2E.Message) string {
 	return ""
 }
 
+// ExtractMediaCaption extracts caption text from media messages (image, video, document, PTV).
+func ExtractMediaCaption(msg *waE2E.Message) string {
+	if msg == nil {
+		return ""
+	}
+	if img := msg.GetImageMessage(); img != nil {
+		return img.GetCaption()
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		return vid.GetCaption()
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		return doc.GetCaption()
+	}
+	if ptv := msg.GetPtvMessage(); ptv != nil {
+		return ptv.GetCaption()
+	}
+	return ""
+}
+
 // ExtractMessageTextFromEvent extracts text content from a WhatsApp event message with emojis
 func ExtractMessageTextFromEvent(evt *events.Message) string {
 	messageText := evt.Message.GetConversation()
@@ -197,6 +217,15 @@ func ExtractMessageTextFromEvent(evt *events.Message) string {
 			messageText = "👤 Contact"
 		} else {
 			messageText = "👤 " + messageText
+		}
+	} else if contactsArrayMessage := evt.Message.GetContactsArrayMessage(); contactsArrayMessage != nil {
+		contacts := contactsArrayMessage.GetContacts()
+		count := len(contacts)
+		displayName := contactsArrayMessage.GetDisplayName()
+		if displayName != "" {
+			messageText = fmt.Sprintf("👥 %s (%d contacts)", displayName, count)
+		} else {
+			messageText = fmt.Sprintf("👥 %d contacts", count)
 		}
 	} else if listMessage := evt.Message.GetListMessage(); listMessage != nil {
 		messageText = listMessage.GetTitle()
@@ -655,11 +684,26 @@ func IsOnWhatsapp(client *whatsmeow.Client, jid string) bool {
 func ValidateJidWithLogin(client *whatsmeow.Client, jid string) (types.JID, error) {
 	MustLogin(client)
 
+	parsedJID, err := ParseJID(jid)
+	if err != nil {
+		return types.JID{}, err
+	}
+
+	// If it's an @lid JID, try to resolve to phone number
+	if parsedJID.Server == "lid" {
+		resolved := ResolveLIDToPhone(context.Background(), parsedJID, client)
+		if resolved.Server != "lid" {
+			parsedJID = resolved // Use resolved phone-based JID
+		}
+		// Skip IsOnWhatsapp check for LIDs
+		return parsedJID, nil
+	}
+
 	if config.WhatsappAccountValidation && !IsOnWhatsapp(client, jid) {
 		return types.JID{}, pkgError.InvalidJID(fmt.Sprintf("Phone %s is not on whatsapp", jid))
 	}
 
-	return ParseJID(jid)
+	return parsedJID, nil
 }
 
 // MustLogin ensures the WhatsApp client is logged in
@@ -672,6 +716,67 @@ func MustLogin(client *whatsmeow.Client) {
 	} else if !client.IsLoggedIn() {
 		panic(pkgError.ErrNotLoggedIn)
 	}
+}
+
+// ResolveLIDToPhone converts @lid JIDs to their corresponding @s.whatsapp.net JIDs
+// Returns the original JID if it's not an @lid or if LID lookup fails
+func ResolveLIDToPhone(ctx context.Context, jid types.JID, client *whatsmeow.Client) types.JID {
+	// Only process @lid JIDs
+	if jid.Server != "lid" {
+		return jid
+	}
+
+	// Safety check
+	if client == nil || client.Store == nil || client.Store.LIDs == nil {
+		logrus.Warnf("Cannot resolve LID %s: client not available", jid.String())
+		return jid
+	}
+
+	// Attempt to get the phone number for this LID
+	pn, err := client.Store.LIDs.GetPNForLID(ctx, jid)
+	if err != nil {
+		logrus.Debugf("Failed to resolve LID %s to phone number: %v", jid.String(), err)
+		return jid
+	}
+
+	// If we got a valid phone number, use it
+	if !pn.IsEmpty() {
+		logrus.Debugf("Resolved LID %s to phone number %s", jid.String(), pn.String())
+		return pn
+	}
+
+	// Fallback to original JID
+	return jid
+}
+
+// ResolvePhoneToLID converts @s.whatsapp.net JIDs to their corresponding @lid JIDs
+// Returns empty JID if it's not a user JID or if LID lookup fails
+func ResolvePhoneToLID(ctx context.Context, jid types.JID, client *whatsmeow.Client) types.JID {
+	// Only process user JIDs
+	if jid.Server != types.DefaultUserServer {
+		return types.JID{}
+	}
+
+	// Safety check
+	if client == nil || client.Store == nil || client.Store.LIDs == nil {
+		logrus.Debugf("Cannot resolve phone %s to LID: client not available", jid.String())
+		return types.JID{}
+	}
+
+	// Attempt to get the LID for this phone number
+	lid, err := client.Store.LIDs.GetLIDForPN(ctx, jid)
+	if err != nil {
+		logrus.Debugf("Failed to resolve phone %s to LID: %v", jid.String(), err)
+		return types.JID{}
+	}
+
+	// If we got a valid LID, return it
+	if !lid.IsEmpty() {
+		logrus.Debugf("Resolved phone %s to LID %s", jid.String(), lid.String())
+		return lid
+	}
+
+	return types.JID{}
 }
 
 // Internal message types for event handling
@@ -697,16 +802,49 @@ func GetMessageDigestOrSignature(msg, key []byte) (string, error) {
 	return hex.EncodeToString(mac.Sum(nil)), nil
 }
 
+// UnwrapMessage unwraps FutureProof wrappers (ephemeral, view-once, etc.)
+// to access the inner message content. WhatsApp wraps messages in these
+// containers when disappearing messages or view-once is enabled.
+// The original message is not modified; the unwrapped inner message is returned.
+func UnwrapMessage(msg *waE2E.Message) *waE2E.Message {
+	if msg == nil {
+		return msg
+	}
+	inner := msg
+	for i := 0; i < 3; i++ { // safeguard against excessively nested wrappers
+		if vm := inner.GetViewOnceMessage(); vm != nil && vm.GetMessage() != nil {
+			inner = vm.GetMessage()
+			continue
+		}
+		if em := inner.GetEphemeralMessage(); em != nil && em.GetMessage() != nil {
+			inner = em.GetMessage()
+			continue
+		}
+		if vm2 := inner.GetViewOnceMessageV2(); vm2 != nil && vm2.GetMessage() != nil {
+			inner = vm2.GetMessage()
+			continue
+		}
+		if vm2e := inner.GetViewOnceMessageV2Extension(); vm2e != nil && vm2e.GetMessage() != nil {
+			inner = vm2e.GetMessage()
+			continue
+		}
+		break
+	}
+	return inner
+}
+
 // BuildEventMessage builds event message structure
 func BuildEventMessage(evt *events.Message) (message EvtMessage) {
-	message.Text = evt.Message.GetConversation()
+	msg := UnwrapMessage(evt.Message)
+
+	message.Text = msg.GetConversation()
 	message.ID = evt.Info.ID
 
-	if extendedMessage := evt.Message.GetExtendedTextMessage(); extendedMessage != nil {
+	if extendedMessage := msg.GetExtendedTextMessage(); extendedMessage != nil {
 		message.Text = extendedMessage.GetText()
 		message.RepliedId = extendedMessage.ContextInfo.GetStanzaID()
 		message.QuotedMessage = extendedMessage.ContextInfo.GetQuotedMessage().GetConversation()
-	} else if protocolMessage := evt.Message.GetProtocolMessage(); protocolMessage != nil {
+	} else if protocolMessage := msg.GetProtocolMessage(); protocolMessage != nil {
 		if editedMessage := protocolMessage.GetEditedMessage(); editedMessage != nil {
 			if extendedText := editedMessage.GetExtendedTextMessage(); extendedText != nil {
 				message.Text = extendedText.GetText()
@@ -719,20 +857,20 @@ func BuildEventMessage(evt *events.Message) (message EvtMessage) {
 	return message
 }
 
-// BuildEventReaction builds event reaction structure
 func BuildEventReaction(evt *events.Message) (waReaction EvtReaction) {
-	if reactionMessage := evt.Message.GetReactionMessage(); reactionMessage != nil {
+	msg := UnwrapMessage(evt.Message)
+	if reactionMessage := msg.GetReactionMessage(); reactionMessage != nil {
 		waReaction.Message = reactionMessage.GetText()
 		waReaction.ID = reactionMessage.GetKey().GetID()
 	}
 	return waReaction
 }
 
-// BuildForwarded checks if message is forwarded
 func BuildForwarded(evt *events.Message) bool {
-	if extendedText := evt.Message.GetExtendedTextMessage(); extendedText != nil {
+	msg := UnwrapMessage(evt.Message)
+	if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
 		return extendedText.ContextInfo.GetIsForwarded()
-	} else if protocolMessage := evt.Message.GetProtocolMessage(); protocolMessage != nil {
+	} else if protocolMessage := msg.GetProtocolMessage(); protocolMessage != nil {
 		if editedMessage := protocolMessage.GetEditedMessage(); editedMessage != nil {
 			if extendedText := editedMessage.GetExtendedTextMessage(); extendedText != nil {
 				return extendedText.ContextInfo.GetIsForwarded()
