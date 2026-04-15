@@ -142,6 +142,9 @@ func buildEventPayload(ctx context.Context, client *whatsmeow.Client, evt *event
 		return "", nil, err
 	}
 
+	// Extract mentioned JIDs from any message type's ContextInfo
+	buildMentionedJIDs(ctx, client, msg, payload)
+
 	return EventTypeMessage, payload, nil
 }
 
@@ -366,4 +369,32 @@ func buildOtherMessageTypes(msg *waE2E.Message, payload map[string]any) {
 	if orderMessage := msg.GetOrderMessage(); orderMessage != nil {
 		payload["order"] = orderMessage
 	}
+}
+
+// buildMentionedJIDs extracts MentionedJID from the ContextInfo of any message
+// type and adds them to the webhook payload as "mentioned_jids". LID-format JIDs
+// are resolved to phone-number JIDs where possible.
+func buildMentionedJIDs(ctx context.Context, client *whatsmeow.Client, msg *waE2E.Message, payload map[string]any) {
+	ci := utils.ExtractContextInfo(msg)
+	if ci == nil {
+		return
+	}
+
+	mentionedJIDs := ci.GetMentionedJID()
+	if len(mentionedJIDs) == 0 {
+		return
+	}
+
+	resolved := make([]string, 0, len(mentionedJIDs))
+	for _, jidStr := range mentionedJIDs {
+		jid, err := types.ParseJID(jidStr)
+		if err != nil {
+			resolved = append(resolved, jidStr)
+			continue
+		}
+		normalized := NormalizeJIDFromLID(ctx, jid, client)
+		resolved = append(resolved, normalized.ToNonAD().String())
+	}
+
+	payload["mentioned_jids"] = resolved
 }

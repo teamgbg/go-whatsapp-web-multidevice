@@ -1,0 +1,5 @@
+[build]
+dockerfilePath = "docker/golang.Dockerfile"
+
+[deploy]
+startCommand = "/app/whatsapp rest --port $PORT"
