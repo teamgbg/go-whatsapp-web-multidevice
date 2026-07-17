@@ -295,6 +295,17 @@ func (m *DeviceManager) LoadExistingDevices(ctx context.Context) error {
 	}
 
 	logrus.Infof("[DEVICE_MANAGER] discovered %d device records in store", len(devices))
+
+	// Fallback: if GetAllDevices returns 0 but GetFirstDevice finds a device
+	// (whatsmeow enumeration gap), add it manually so the device manager
+	// can discover already-paired sessions without re-pairing.
+	if len(devices) == 0 {
+		if firstDev, firstErr := m.store.GetFirstDevice(ctx); firstErr == nil && firstDev != nil {
+			logrus.Infof("[DEVICE_MANAGER] fallback GetFirstDevice found device, adding to manager")
+			devices = append(devices, firstDev)
+		}
+	}
+
 	for _, dev := range devices {
 		if dev == nil || dev.ID == nil {
 			continue
