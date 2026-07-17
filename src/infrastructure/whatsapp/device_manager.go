@@ -302,7 +302,27 @@ func (m *DeviceManager) LoadExistingDevices(ctx context.Context) error {
 	if len(devices) == 0 {
 		if firstDev, firstErr := m.store.GetFirstDevice(ctx); firstErr == nil && firstDev != nil {
 			logrus.Infof("[DEVICE_MANAGER] fallback GetFirstDevice found device, adding to manager")
-			devices = append(devices, firstDev)
+			// If the device has no ID (data corruption), generate one so it
+			// can be registered in the device manager and reconnected.
+			if firstDev.ID == nil {
+				logrus.Warn("[DEVICE_MANAGER] fallback device has nil ID, generating placeholder")
+				// Create a placeholder device instance so the device manager
+				// has a handle to attempt reconnection. The client will
+				// populate the real JID on successful reconnect.
+				placeholderID := fiberUtils.UUID()
+				instance := NewDeviceInstance(placeholderID, nil, newDeviceChatStorage(placeholderID, m.storage))
+				instance.SetState(domainDevice.DeviceStateDisconnected)
+				m.AddDevice(instance)
+				if m.storage != nil {
+					_ = m.storage.SaveDeviceRecord(&domainChatStorage.DeviceRecord{
+						DeviceID:    placeholderID,
+						CreatedAt:   time.Now(),
+						UpdatedAt:   time.Now(),
+					})
+				}
+			} else {
+				devices = append(devices, firstDev)
+			}
 		}
 	}
 
