@@ -121,6 +121,16 @@ func (m *DeviceManager) ResolveDevice(deviceID string) (*DeviceInstance, string,
 		return inst, inst.ID(), nil
 	}
 
+	// Fallback: if there are multiple devices and none was requested,
+	// use the first available device so API calls don't fail.
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, inst := range m.devices {
+		if inst != nil {
+			return inst, inst.ID(), nil
+		}
+	}
+
 	return nil, "", fmt.Errorf("device id is required")
 }
 
