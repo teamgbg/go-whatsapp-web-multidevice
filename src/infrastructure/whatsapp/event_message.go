@@ -12,7 +12,6 @@ import (
 	"go.mau.fi/whatsmeow/types"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
-	pkgError "github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/error"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
 	"github.com/sirupsen/logrus"
 	"go.mau.fi/whatsmeow/types/events"
@@ -35,6 +34,12 @@ type WebhookEvent struct {
 	Payload  map[string]any `json:"payload"`
 }
 
+type webhookContactPayload struct {
+	DisplayName string `json:"displayName"`
+	VCard       string `json:"vcard"`
+	PhoneNumber string `json:"phone_number,omitempty"`
+}
+
 // forwardMessageToWebhook is a helper function to forward message event to webhook url
 func forwardMessageToWebhook(ctx context.Context, client *whatsmeow.Client, evt *events.Message) error {
 	webhookEvent, err := createWebhookEvent(ctx, client, evt)
@@ -49,6 +54,14 @@ func forwardMessageToWebhook(ctx context.Context, client *whatsmeow.Client, evt 
 	}
 
 	return forwardPayloadToConfiguredWebhooks(ctx, payload, webhookEvent.Event)
+}
+
+func isReactionMessage(evt *events.Message) bool {
+	if evt == nil || evt.Message == nil {
+		return false
+	}
+
+	return utils.UnwrapMessage(evt.Message).GetReactionMessage() != nil
 }
 
 func createWebhookEvent(ctx context.Context, client *whatsmeow.Client, evt *events.Message) (*WebhookEvent, error) {
@@ -87,10 +100,26 @@ func buildEventPayload(ctx context.Context, client *whatsmeow.Client, evt *event
 
 	// Build from/from_lid fields
 	buildFromFields(ctx, client, evt, payload)
+	addSenderDisplayName(ctx, client, payload, evt.Info.IsFromMe, evt.Info.PushName)
 
 	// Set from_name (pushname)
 	if pushname := evt.Info.PushName; pushname != "" {
 		payload["from_name"] = pushname
+	}
+
+	// Modern WhatsApp clients (LID-migrated accounts on recent app builds) wrap
+	// message edits in a SecretEncryptedMessage with encType=MESSAGE_EDIT instead
+	// of sending them as a plain ProtocolMessage{MESSAGE_EDIT}. Decrypt those
+	// here using whatsmeow's existing helper, then fall through to the standard
+	// MESSAGE_EDIT extraction path using the decrypted inner Message.
+	if sem := msg.GetSecretEncryptedMessage(); sem != nil &&
+		sem.GetSecretEncType() == waE2E.SecretEncryptedMessage_MESSAGE_EDIT &&
+		client != nil {
+		if decrypted, err := client.DecryptSecretEncryptedMessage(ctx, evt); err != nil {
+			logrus.Warnf("Failed to decrypt SecretEncryptedMessage(MESSAGE_EDIT) for %s: %v", evt.Info.ID, err)
+		} else if decrypted != nil {
+			msg = utils.UnwrapMessage(decrypted)
+		}
 	}
 
 	// Check for protocol messages (revoke, edit)
@@ -240,10 +269,13 @@ func buildMediaFields(ctx context.Context, client *whatsmeow.Client, msg *waE2E.
 		if config.WhatsappAutoDownloadMedia {
 			extracted, err := utils.ExtractMedia(ctx, client, config.PathMedia, audioMedia)
 			if err != nil {
+				// Media expired/unavailable: skip the attachment but keep
+				// forwarding the message so its body/caption still reaches
+				// downstream consumers, instead of dropping the whole event.
 				logrus.Errorf("Failed to download audio: %v", err)
-				return pkgError.WebhookError(fmt.Sprintf("Failed to download audio: %v", err))
+			} else {
+				payload["audio"] = extracted.MediaPath
 			}
-			payload["audio"] = extracted.MediaPath
 		} else {
 			payload["audio"] = map[string]any{
 				"url": audioMedia.GetURL(),
@@ -255,10 +287,13 @@ func buildMediaFields(ctx context.Context, client *whatsmeow.Client, msg *waE2E.
 		if config.WhatsappAutoDownloadMedia {
 			extracted, err := utils.ExtractMedia(ctx, client, config.PathMedia, documentMedia)
 			if err != nil {
+				// Media expired/unavailable: skip the attachment but keep
+				// forwarding the message so its body/caption still reaches
+				// downstream consumers, instead of dropping the whole event.
 				logrus.Errorf("Failed to download document: %v", err)
-				return pkgError.WebhookError(fmt.Sprintf("Failed to download document: %v", err))
+			} else {
+				payload["document"] = buildAutoDownloadPayload(extracted)
 			}
-			payload["document"] = buildAutoDownloadPayload(extracted)
 		} else {
 			payload["document"] = map[string]any{
 				"url":      documentMedia.GetURL(),
@@ -271,10 +306,13 @@ func buildMediaFields(ctx context.Context, client *whatsmeow.Client, msg *waE2E.
 		if config.WhatsappAutoDownloadMedia {
 			extracted, err := utils.ExtractMedia(ctx, client, config.PathMedia, imageMedia)
 			if err != nil {
+				// Media expired/unavailable: skip the attachment but keep
+				// forwarding the message so its body/caption still reaches
+				// downstream consumers, instead of dropping the whole event.
 				logrus.Errorf("Failed to download image: %v", err)
-				return pkgError.WebhookError(fmt.Sprintf("Failed to download image: %v", err))
+			} else {
+				payload["image"] = buildAutoDownloadPayload(extracted)
 			}
-			payload["image"] = buildAutoDownloadPayload(extracted)
 		} else {
 			payload["image"] = map[string]any{
 				"url":     imageMedia.GetURL(),
@@ -287,10 +325,13 @@ func buildMediaFields(ctx context.Context, client *whatsmeow.Client, msg *waE2E.
 		if config.WhatsappAutoDownloadMedia {
 			extracted, err := utils.ExtractMedia(ctx, client, config.PathMedia, stickerMedia)
 			if err != nil {
+				// Media expired/unavailable: skip the attachment but keep
+				// forwarding the message so its body/caption still reaches
+				// downstream consumers, instead of dropping the whole event.
 				logrus.Errorf("Failed to download sticker: %v", err)
-				return pkgError.WebhookError(fmt.Sprintf("Failed to download sticker: %v", err))
+			} else {
+				payload["sticker"] = extracted.MediaPath
 			}
-			payload["sticker"] = extracted.MediaPath
 		} else {
 			payload["sticker"] = map[string]any{
 				"url": stickerMedia.GetURL(),
@@ -302,10 +343,13 @@ func buildMediaFields(ctx context.Context, client *whatsmeow.Client, msg *waE2E.
 		if config.WhatsappAutoDownloadMedia {
 			extracted, err := utils.ExtractMedia(ctx, client, config.PathMedia, videoMedia)
 			if err != nil {
+				// Media expired/unavailable: skip the attachment but keep
+				// forwarding the message so its body/caption still reaches
+				// downstream consumers, instead of dropping the whole event.
 				logrus.Errorf("Failed to download video: %v", err)
-				return pkgError.WebhookError(fmt.Sprintf("Failed to download video: %v", err))
+			} else {
+				payload["video"] = buildAutoDownloadPayload(extracted)
 			}
-			payload["video"] = buildAutoDownloadPayload(extracted)
 		} else {
 			payload["video"] = map[string]any{
 				"url":     videoMedia.GetURL(),
@@ -318,10 +362,13 @@ func buildMediaFields(ctx context.Context, client *whatsmeow.Client, msg *waE2E.
 		if config.WhatsappAutoDownloadMedia {
 			extracted, err := utils.ExtractMedia(ctx, client, config.PathMedia, ptvMedia)
 			if err != nil {
+				// Media expired/unavailable: skip the attachment but keep
+				// forwarding the message so its body/caption still reaches
+				// downstream consumers, instead of dropping the whole event.
 				logrus.Errorf("Failed to download video note: %v", err)
-				return pkgError.WebhookError(fmt.Sprintf("Failed to download video note: %v", err))
+			} else {
+				payload["video_note"] = buildAutoDownloadPayload(extracted)
 			}
-			payload["video_note"] = buildAutoDownloadPayload(extracted)
 		} else {
 			payload["video_note"] = map[string]any{
 				"url":     ptvMedia.GetURL(),
@@ -347,11 +394,11 @@ func buildAutoDownloadPayload(extracted utils.ExtractedMedia) any {
 
 func buildOtherMessageTypes(msg *waE2E.Message, payload map[string]any) {
 	if contactMessage := msg.GetContactMessage(); contactMessage != nil {
-		payload["contact"] = contactMessage
+		payload["contact"] = buildWebhookContactPayload(contactMessage)
 	}
 
 	if contactsArrayMessage := msg.GetContactsArrayMessage(); contactsArrayMessage != nil {
-		payload["contacts_array"] = contactsArrayMessage.GetContacts()
+		payload["contacts_array"] = buildWebhookContactsArrayPayload(contactsArrayMessage.GetContacts())
 	}
 
 	if listMessage := msg.GetListMessage(); listMessage != nil {
@@ -369,6 +416,30 @@ func buildOtherMessageTypes(msg *waE2E.Message, payload map[string]any) {
 	if orderMessage := msg.GetOrderMessage(); orderMessage != nil {
 		payload["order"] = orderMessage
 	}
+}
+
+func buildWebhookContactPayload(contact *waE2E.ContactMessage) webhookContactPayload {
+	if contact == nil {
+		return webhookContactPayload{}
+	}
+
+	vcard := contact.GetVcard()
+	return webhookContactPayload{
+		DisplayName: contact.GetDisplayName(),
+		VCard:       vcard,
+		PhoneNumber: utils.ExtractPhoneFromVCard(vcard),
+	}
+}
+
+func buildWebhookContactsArrayPayload(contacts []*waE2E.ContactMessage) []webhookContactPayload {
+	result := make([]webhookContactPayload, 0, len(contacts))
+	for _, contact := range contacts {
+		if contact == nil {
+			continue
+		}
+		result = append(result, buildWebhookContactPayload(contact))
+	}
+	return result
 }
 
 // buildMentionedJIDs extracts MentionedJID from the ContextInfo of any message
